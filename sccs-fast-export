@@ -16,6 +16,7 @@ my $config_prefix = "sccs-fast-export";
 $hostname = `hostname -f 2> /dev/null || hostname`;
 chomp $hostname;
 undef $authors_file;
+$authors_map = {};
 $auto_null_delta = 0;	# Do we include AUTO NULL DELTA in output?
 
 Getopt::Long::Configure ("bundling");
@@ -83,15 +84,15 @@ sub export
 		&emit ("commit refs/heads/master");
 		&emit ("mark :$delta->{seq}");
 		my $name_and_email;
-		if (exists $authors_map{$delta->{username}}) {
-			$name_and_email = $authors_map{$delta->{username}};
+		if (exists $authors_map->{$delta->{username}}) {
+			$name_and_email = $authors_map->{$delta->{username}};
 		}
 		elsif (@pw = getpwnam ($delta->{username})) {
 			$name_and_email = $pw[6];
 			$name_and_email =~ s/ *,+$//;
 			$name_and_email .= " <$delta->{username}\@$hostname>";
 			# Cache for later;
-			$authors_map{$delta->{username}} = $name_and_email;
+			$authors_map->{$delta->{username}} = $name_and_email;
 		}
 		else {
 			$name_and_email = "$delta->{username} <empty>";
