@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-# Copyright (c) 2014 Eric Krohn
+# Copyright (c) 2015 Eric Krohn
 # License: ISC <http://opensource.org/licenses/ISC>
 # 
 # Convert a single SCCS s.file to git's fast-import format.
@@ -81,7 +81,14 @@ sub export
 			next;
 		}
 
-		&emit ("commit refs/heads/master");
+		if (($delta->{sid} =~ tr/././) >= 3) {
+			# For branches use just the first three segments of SID.
+			my $branch_label = join ('.', (split (/\./, $delta->{sid}))[0,1,2]);
+			&emit ("commit refs/heads/$branch_label");
+		}
+		else {
+			&emit ("commit refs/heads/master");
+		}
 		&emit ("mark :$delta->{seq}");
 		my $name_and_email;
 		if (exists $authors_map->{$delta->{username}}) {
