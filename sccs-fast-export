@@ -1,0 +1,347 @@
+#!/usr/bin/perl
+# Copyright (c) 2014 Eric Krohn
+# License: ISC <http://opensource.org/licenses/ISC>
+# 
+# Convert a single SCCS s.file to git's fast-import format.
+# Reads the delta table directly from the s.file, however, uses sccs get (or
+# just get) to extract the various deltas from the s.file.
+
+use Getopt::Long;
+use Time::Local;
+use IO::File;
+
+($Command = $0) =~ s,^.*/,,;
+my $help = 0;
+my $config_prefix = "sccs-fast-export";
+$hostname = `hostname -f 2> /dev/null || hostname`;
+chomp $hostname;
+undef $authors_file;
+$auto_null_delta = 0;	# Do we include AUTO NULL DELTA in output?
+
+Getopt::Long::Configure ("bundling");
+GetOptions (
+	"help|?" => \$help,
+	"authors-file|A=s" => \$authors_file,
+	"autonulldelta|auto-null-delta|N!" => \$auto_null_delta,
+) or &Usage ();
+&Usage () if ($help);
+
+if ($authors_file) {
+	$authors_map = &load_authors_file ($authors_file);
+}
+
+while (@ARGV > 0) {
+	$file = shift (@ARGV);
+	if (-d $file) {
+		opendir (DIR, $file);
+		my @files = sort (grep (!/^\./, readdir (DIR)));
+		grep (s,^,$file/,, @files);
+		closedir (DIR);
+		unshift (@ARGV, @files);
+	}
+	elsif ($file =~ m,(^|.*/)s\.[^/]+$,) {
+		$info = &get_sccs_info ($file);
+		&export ($file, $info);
+	}
+	else {
+		next; # skip non-SCCS file
+	}
+	1;
+}
+
+exit $exit;
+########
+
+# Export each delta of the file.
+sub export
+{
+	my ($sfile, $sccs_info) = @_;
+	local $_;
+	&emit ("# file $sfile");
+	my $basename = &sccs_basename ($sfile);
+	my $delta_table = $sccs_info->{delta_table};
+	my $highest_seq = $#{$delta_table};
+	# commit marks use the SCCS seq number.
+	for my $seq (1 .. $highest_seq) {
+		if (! exists $delta_table->[$seq]) {
+			&emit ("# ignore missing delta sequence $seq");
+			next;
+		}
+		my $delta = $delta_table->[$seq];
+		&emit ("# $delta->{type} $delta->{sid} $delta->{seq} $delta->{prevseq}");
+		if ($delta->{type} eq "R") {
+			&emit ("# skip removed delta $delta->{sid} $delta->{seq}");
+			next;
+		}
+
+		if (!$auto_null_delta && $delta->{comment} eq "AUTO NULL DELTA\n"
+		&& scalar keys %{$delta->{child}} == 1) {
+			&emit ("# skip AUTO NULL DELTA $delta->{sid}");
+			next;
+		}
+
+		&emit ("commit refs/heads/master");
+		&emit ("mark :$delta->{seq}");
+		my $name_and_email;
+		if (exists $authors_map{$delta->{username}}) {
+			$name_and_email = $authors_map{$delta->{username}};
+		}
+		elsif (@pw = getpwnam ($delta->{username})) {
+			$name_and_email = $pw[6];
+			$name_and_email =~ s/ *,+$//;
+			$name_and_email .= " <$delta->{username}\@$hostname>";
+			# Cache for later;
+			$authors_map{$delta->{username}} = $name_and_email;
+		}
+		else {
+			$name_and_email = "$delta->{username} <empty>";
+		}
+		&emit ("committer $name_and_email $delta->{time} +0000");
+		&emit_data ($delta->{comment});
+
+		my $prevseq = $delta->{prevseq};
+		while (!$auto_null_delta && $prevseq > 0
+		&& exists $delta_table->[$prevseq]
+		&& $delta_table->[$prevseq]->{comment} eq "AUTO NULL DELTA\n") {
+			$prevseq = $delta_table->[$prevseq]->{prevseq};
+		}
+		if ($prevseq > 0) {
+			&emit ("from :$prevseq");
+		}
+
+		# Since this covers just a single s.file, we use the more concise
+		# inline format for the payload.
+		&emit ("M 644 inline $basename");
+		my $content = &get_delta ($sfile, $delta->{sid});
+		&emit_data ($content);
+		0;
+	}
+	return;
+}
+
+# Return the entire content of $sfile's delta $sid.
+sub get_delta
+{
+	my ($sfile, $sid) = @_;
+	die ("$Command: missing SID in get_delta") if (! defined $sid);
+	# sccs get 
+	my @content;
+	local $_;
+	open (GET, "-|") or exec "sccs", "get", "-r$sid", "-p", $sfile;
+	while ($_ = <GET>) {
+		push (@content, $_);
+	}
+	close (GET);
+	return join ("", @content);
+}
+
+# Extract and remember all the delta information.
+sub get_sccs_info
+{
+	my ($sfile) = @_;
+	my $fh = IO::File->new ($sfile, "r");
+	if (!defined $fh) {
+		die ("$Command: cannot read $sfile: $!");
+	}
+	local $_;
+	my @delta_info;
+	my $sccs_info = {
+		delta_table => \@delta_info,
+		flags => {},
+	};
+	my ($delta, $hold);
+	my ($type, $sid, $year, $month, $day, $hour, $minute, $second, $username,
+		$seq, $prevseq);
+	while ($_ = $fh->getline) {
+		if ($. == 1) {
+			if (/^\001h\d{5}$/) {
+				# Ignore header checksum at beginning of s.file.
+			}
+			else {
+				# No SCCS header!
+				print STDERR ("$Command: Error: $sfile does not have an SCCS header!\n");
+				undef $fh;
+				$exit = 1;
+				return;
+			}
+		}
+		elsif (m,^\001s (\d+)/(\d+)/(\d+),) {
+			# Start of a delta entry.
+			$hold = {
+				added => $1,
+				removed => $2,
+				unchanged => $3,
+			};
+		}
+		elsif (($type, $sid, $year, $month, $day, $hour, $minute, $second,
+			$username, $seq, $prevseq) = m,^\001d ([DR]) (\d[.\d]+) (\d+)/(\d+)/(\d+) (\d+):(\d+):(\d+) (\S+) (\d+) (\d+),) {
+			# Delta information.
+			# If it already exists, then a higher delta seq
+			# has this as parent.
+			if (!exists $delta_info[$seq]) {
+				$delta_info[$seq] = $delta = $hold;
+			}
+			else {
+				$delta = $delta_info[$seq];
+				# Copy in $hold from previous line.
+				for my $field (qw(added removed unchanged)) {
+					$delta->{$field} = $hold->{$field};
+				}
+			}
+			$delta->{type} = $type;	# D = delta, R = removed
+			$delta->{sid} = $sid;	# SCCS ID (x.y, or x.y.z.w)
+			$delta->{year} = $year;	# 2-digit year
+			$delta->{month} = $month;
+			$delta->{day} = $day;
+			$delta->{hour} = $hour;
+			$delta->{minute} = $minute;
+			$delta->{second} = $second;
+			$delta->{username} = $username;
+			$delta->{seq} = $seq;	# sequence number of this delta
+			$delta->{prevseq} = $prevseq;	# sequence number of previous delta ("parent")
+			if ($year < 100) {
+				# Traditional SCCS format has just 2-digit year.
+				$year += 1900;
+			}
+			if ($year < 1970) {
+				# Y2K adjustment.
+				$year += 100;
+			}
+			$month -= 1;
+			# Convert local time to time_t.
+			my $time = timelocal ($second, $minute, $hour, $day,
+				$month, $year);
+			$delta->{time} = $time;
+			# Reverse thread the tree to point to children.
+			if ($delta->{type} eq "D" && $prevseq != 0) {
+				$delta_info[$prevseq]->{child}->{$seq} = $prevseq;
+			}
+		}
+		elsif (m,^\001c (.*),) {
+			# Comment
+			$delta->{comment} .= $1 . "\n";
+		}
+		elsif (m,^\001m (.*),) {
+			# MR
+			$delta->{mr} .= $1 . "\n";
+		}
+		elsif (m,^\001i (\d+) (.*),) {
+			# Serial numbers included.
+			die ("$Command: $sfile:$.: \@i (included serial numbers) not handled");
+		}
+		elsif (m,^\001x (\d+) (.*),) {
+			# Serial numbers excluded.
+			die ("$Command: $sfile:$.: \@x (excluded serial numbers) not handled");
+		}
+		elsif (m,^\001g (\d+) (.*),) {
+			# Serial numbers ignored.
+			die ("$Command: $sfile:$.: \@g (ignored serial numbers) not handled");
+		}
+		elsif (m,^\001e,) {
+			# end of a delta entry
+			undef $delta;
+		}
+		elsif (m,^\001u,) {
+			# We do not care about the allowed username table.
+			&get_until_regexp ($fh, $sccs_info, "userlist", qr/^\001U/);
+		}
+		elsif (m,^\001t,) {
+			# We do not care about the file comments.
+			&get_until_regexp ($fh, $sccs_info, "comments", qr/^\001T/);
+		}
+		elsif (m,^\001f (\w)(?: (.*))?,) {
+			# Flags are per s.file and we do not care about them.
+			# Well, we may care about the 'e' (encode) flag.
+			$sccs_info->{flags}->{$1} = $2;
+		}
+		elsif (m,^\001[IDE],) {
+			# This is the body.
+			last;
+		}
+	}
+	undef $fh;
+	return $sccs_info;
+}
+
+sub load_authors_file
+{
+	my ($file) = @_;
+	my $hash = {};
+	local $_;
+	my $fh = IO::File->new ($file, "r");
+	if (!defined $fh) {
+		die ("$Command: cannot read authors file '$file': $!");
+	}
+	while ($_ = $fh->getline) {
+		next if /^\s*$/;
+		next if /^\s*#/;
+		($username, $author) = split (/=/, $_);
+		for ($username, $author) {
+			s/^\s*//;
+			s/\s*$//;
+		}
+		$hash->{$username} = $author;
+	}
+	return $hash;
+}
+
+sub get_until_regexp
+{
+	my ($fh, $hash, $key, $regexp) = @_;
+	local ($_);
+	while ($_ = $fh->getline) {
+		if ($_ =~ $regexp) {
+			last;
+		}
+		chomp $_;
+		push (@{$hash->{$key}}, $_);
+	}
+	return;
+}
+
+sub emit
+{
+	my ($content) = @_;
+	print ($content, "\n");
+}
+
+sub emit_data
+{
+	my ($content) = @_;
+	&emit ("data " . length ($content));
+	print ($content, "\n");
+}
+
+sub sccs_basename
+{
+	my ($file) = @_;
+	$file =~ s,(^|.*/)s\.,,;
+	return $file;
+}
+
+sub Usage
+{
+	my (@msgs) = @_;
+	for (@msgs) {
+		print STDERR $_, "\n";
+	}
+	die << "USAGE";
+$Command turns a SCCS file or directory containing multiple SCCS files
+into a stream of output suitable to be read by git's fast-import subcommand.
+Each delta turns into a separate commit.
+Beware: $Command probably fails with multibyte characters!
+Performance: O(d*s), where d is number of deltas, s is size of SCCS file.
+
+Options:
+	--help -?	Show this help.
+	--authors-file -A file
+		Specify a file containing username = Full Name <email> mappings.
+	--autonulldelta --auto-null-delta -N
+		Include AUTO NULL DELTAs in output. (default)
+	--noautonulldelta --noauto-null-delta
+		Do not include AUTO NULL DELTAs in output.
+USAGE
+}
+
+
+# vim: ft=perl
