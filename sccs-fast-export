@@ -18,6 +18,8 @@ chomp $hostname;
 undef $authors_file;
 $authors_map = {};
 $auto_null_delta = 0;	# Do we include AUTO NULL DELTA in output?
+chomp ($timezone = `date '+%z'`);
+$timezone = "+0000" if ($timezone eq "");
 
 Getopt::Long::Configure ("bundling");
 GetOptions (
@@ -112,7 +114,7 @@ sub export
 		else {
 			$name_and_email = "$delta->{username} <empty>";
 		}
-		&emit ("committer $name_and_email $delta->{time} +0000");
+		&emit ("committer $name_and_email $delta->{time} $timezone");
 		&emit_data ($delta->{comment});
 
 		my $prevseq = $delta->{prevseq};
