@@ -42,3 +42,6 @@ sccs-fast-export reads an SCCS file to parse the delta table, runs `sccs` `get`
 to read the delta contents, and outputs each delta as a separate commit.
 It does a little bookkeeping to keep track of which deltas are terminal.
 
+sccs-fast-export could run `sccs` `prt` or `prs` to get the delta table, but
+it would be slightly ambiguous to parse, so we parse the s.file itself.
+
