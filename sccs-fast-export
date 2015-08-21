@@ -40,7 +40,15 @@ while (@ARGV > 0) {
 		closedir (DIR);
 		unshift (@ARGV, @files);
 	}
+	# s-file
 	elsif ($file =~ m,(^|.*/)s\.[^/]+$,) {
+		$info = &get_sccs_info ($file);
+		&export ($file, $info);
+	}
+	# g-file
+	elsif ($file =~ m,(^|.*/)([^/]+)$, && -f "${1}SCCS/s.$2") {
+		# We were given the g-file; change to the s-file.
+		$file = "${1}SCCS/s.$2";
 		$info = &get_sccs_info ($file);
 		&export ($file, $info);
 	}
@@ -143,7 +151,7 @@ sub get_delta
 	return join ("", @content);
 }
 
-# Extract and remember all the delta information.
+# Extract and remember all the delta information from the s-file.
 sub get_sccs_info
 {
 	my ($sfile) = @_;
