@@ -18,8 +18,6 @@ chomp $hostname;
 undef $authors_file;
 $authors_map = {};
 $auto_null_delta = 0;	# Do we include AUTO NULL DELTA in output?
-chomp ($timezone = `date '+%z'`);
-$timezone = "+0000" if ($timezone eq "");
 
 Getopt::Long::Configure ("bundling");
 GetOptions (
@@ -27,7 +25,7 @@ GetOptions (
 	"authors-file|A=s" => \$authors_file,
 	"autonulldelta|auto-null-delta|N!" => \$auto_null_delta,
 ) or &Usage ();
-&Usage () if ($help);
+&Usage () if ($help || @ARGV == 0);
 
 if ($authors_file) {
 	$authors_map = &load_authors_file ($authors_file);
@@ -114,7 +112,8 @@ sub export
 		else {
 			$name_and_email = "$delta->{username} <empty>";
 		}
-		&emit ("committer $name_and_email $delta->{time} $timezone");
+		my $timestamp = &git_time ($delta->{datetime});
+		&emit ("committer $name_and_email $timestamp");
 		&emit_data ($delta->{comment});
 
 		my $prevseq = $delta->{prevseq};
@@ -191,8 +190,8 @@ sub get_sccs_info
 				unchanged => $3,
 			};
 		}
-		elsif (($type, $sid, $year, $month, $day, $hour, $minute, $second,
-			$username, $seq, $prevseq) = m,^\001d ([DR]) (\d[.\d]+) (\d+)/(\d+)/(\d+) (\d+):(\d+):(\d+) (\S+) (\d+) (\d+),) {
+		elsif (($type, $sid, $datetime, $username, $seq, $prevseq) =
+			m,^\001d ([DR]) (\d[.\d]+) (\d+/\d+/\d+ \d+:\d+:\d+) (\S+) (\d+) (\d+),) {
 			# Delta information.
 			# If it already exists, then a higher delta seq
 			# has this as parent.
@@ -208,28 +207,10 @@ sub get_sccs_info
 			}
 			$delta->{type} = $type;	# D = delta, R = removed
 			$delta->{sid} = $sid;	# SCCS ID (x.y, or x.y.z.w)
-			$delta->{year} = $year;	# 2-digit year
-			$delta->{month} = $month;
-			$delta->{day} = $day;
-			$delta->{hour} = $hour;
-			$delta->{minute} = $minute;
-			$delta->{second} = $second;
+			$delta->{datetime} = $datetime;	# YY/MM/DD HH:MM:SS
 			$delta->{username} = $username;
 			$delta->{seq} = $seq;	# sequence number of this delta
 			$delta->{prevseq} = $prevseq;	# sequence number of previous delta ("parent")
-			if ($year < 100) {
-				# Traditional SCCS format has just 2-digit year.
-				$year += 1900;
-			}
-			if ($year < 1970) {
-				# Y2K adjustment.
-				$year += 100;
-			}
-			$month -= 1;
-			# Convert local time to time_t.
-			my $time = timelocal ($second, $minute, $hour, $day,
-				$month, $year);
-			$delta->{time} = $time;
 			# Reverse thread the tree to point to children.
 			if ($delta->{type} eq "D" && $prevseq != 0) {
 				$delta_info[$prevseq]->{child}->{$seq} = $prevseq;
@@ -337,6 +318,36 @@ sub sccs_basename
 	return $file;
 }
 
+# Convert SCCS timestamp (YY/MM/DD HH:MM:SS) to git timestamp (time_t and TZ offset).
+# We cannot absolutely determine the time because SCCS stores its timestamp in
+# whatever the local timezone was for the committer, but without any indicator of
+# what timezone that was. We assume the current timezone.
+sub git_time
+{
+	my ($sccs_time) = @_;
+	if ($sccs_time !~ m,^(\d+)/(\d+)/(\d+) (\d+):(\d+):(\d+),) {
+		die ("$Command: bad sccs time stamp: $sccs_time");
+	}
+	my ($year, $month, $day, $hour, $minute, $second) = ($1, $2, $3, $4, $5, $6);
+	if ($year < 100) {
+		# Traditional SCCS format has just 2-digit year.
+		$year += 1900;
+	}
+	if ($year < 1970) {
+		# Y2K adjustment. This is different than Time::Local's convention,
+		# but is reasonable given that SCCS was invented circa 1972.
+		$year += 100;
+	}
+	$month -= 1;
+	# Convert local time to time_t.
+	my $time = timelocal ($second, $minute, $hour, $day, $month, $year);
+	my $gmtime = timegm ($second, $minute, $hour, $day, $month, $year);
+	my $offset_seconds = $gmtime - $time;
+	my $zone_offset = sprintf ("%+03.2d%02.2d",
+		int ($offset_seconds / 3600), int (($offset_seconds % 3600) / 60));
+	return "$time $zone_offset";
+}
+
 sub Usage
 {
 	my (@msgs) = @_;
@@ -344,6 +355,8 @@ sub Usage
 		print STDERR $_, "\n";
 	}
 	die << "USAGE";
+Usage: $Command [options] SCCS-file|SCCS-directory ...
+
 $Command turns a SCCS file or directory containing multiple SCCS files
 into a stream of output suitable to be read by git's fast-import subcommand.
 Each delta turns into a separate commit.
